@@ -1,21 +1,93 @@
 /* =========================================================
    TORNEO GREMIAL — script.js
-   Menú móvil, countdown al silbatazo inicial y validación
-   simple del formulario de inscripción.
+   100% JavaScript de navegador (sin PHP, sin Apps Script, sin
+   backend): trae los datos del torneo desde Google Sheets como CSV
+   y las plantillas de cada sección (equipos.html, partidos_
+   proximos.html, partidos_jugados.html) con fetch(), y arma el HTML
+   final en el propio navegador.
+
+   IMPORTANTE: fetch() de archivos locales necesita que el sitio se
+   sirva por http/https (Live Server, GitHub Pages, Netlify, etc.).
+   Si abres index.html directamente con doble clic (protocolo
+   file://), el navegador bloquea esos fetch() por seguridad.
    ========================================================= */
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   initMobileNav();
   initCountdown();
+  initMatchTabs();
   initStandings();
-  initMatches();
+
+  try {
+    const [teamTemplates, proximoTemplate, jugadoTemplate] = await Promise.all([
+      cargarPlantillasEquipos("equipos.html"),
+      cargarPlantillaUnica("partidos_proximos.html", "proximo-row-template"),
+      cargarPlantillaUnica("partidos_jugados.html", "jugado-row-template"),
+    ]);
+
+    const teamNames = await initTeams(teamTemplates);
+    initMatches(teamNames, proximoTemplate, jugadoTemplate);
+  } catch (err) {
+    console.error("No se pudieron cargar las plantillas HTML (equipos.html, partidos_proximos.html, partidos_jugados.html). Verifica que estén en la misma carpeta que index.html y que el sitio se sirva por http/https.", err);
+    const teamsGrid = document.getElementById("teams-grid");
+    if (teamsGrid) teamsGrid.innerHTML = '<p class="standings-error">No se pudieron cargar las plantillas. Revisa la consola.</p>';
+    const proximosList = document.getElementById("match-list-proximos");
+    const jugadosList = document.getElementById("match-list-jugados");
+    if (proximosList) proximosList.innerHTML = '<p class="standings-error">No se pudieron cargar las plantillas. Revisa la consola.</p>';
+    if (jugadosList) jugadosList.innerHTML = '<p class="standings-error">No se pudieron cargar las plantillas. Revisa la consola.</p>';
+  }
 });
+
+/* ---------- Traer las plantillas .html de cada sección ---------- */
+async function cargarPlantillasEquipos(url) {
+  const doc = await fetchComoDocumento(url);
+  return {
+    equipo: obtenerTemplate(doc, "team-card-template", url).innerHTML.trim(),
+    jugador: obtenerTemplate(doc, "player-card-template", url).innerHTML.trim(),
+  };
+}
+
+async function cargarPlantillaUnica(url, templateId) {
+  const doc = await fetchComoDocumento(url);
+  return obtenerTemplate(doc, templateId, url).innerHTML.trim();
+}
+
+async function fetchComoDocumento(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`No se pudo traer "${url}" (HTTP ${response.status}). ¿Está en la misma carpeta que index.html?`);
+  }
+  const html = await response.text();
+  return new DOMParser().parseFromString(html, "text/html");
+}
+
+function obtenerTemplate(doc, templateId, url) {
+  const el = doc.getElementById(templateId);
+  if (!el) {
+    throw new Error(`No se encontró el <template id="${templateId}"> dentro de "${url}".`);
+  }
+  return el;
+}
+
+// Reemplaza cada {{TOKEN}} de una plantilla por el valor real.
+function rellenarPlantilla(plantilla, datos) {
+  return plantilla.replace(/{{(\w+)}}/g, (_, clave) =>
+    datos[clave] !== undefined ? datos[clave] : "",
+  );
+}
 
 /* ---------- Tabla de posiciones en vivo (Google Sheets) ---------- */
 // URL del rango ya ordenado (hoja "Posiciones", columnas N:W) de tu Google Sheet.
 // Si cambias de spreadsheet o mueves la tabla de columna, actualiza esta URL.
 const SHEET_ID = "16SPJe7pkLcJurVrMVFH2VMsg0gAscddnH8CGonias_g";
 const STANDINGS_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Posiciones&range=N1:W18`;
+
+// Pestaña "Equipos": columnas esperadas A Equipo | B Escudo (URL de imagen).
+// Pestaña "Jugadores": columnas esperadas A Equipo | B Jugador | C Foto (URL).
+// Ambas deben vivir en el mismo spreadsheet (SHEET_ID) y estar compartidas
+// como "cualquiera con el enlace puede ver".
+const TEAMS_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Equipos`;
+const PLAYERS_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Jugadores`;
 
 function initStandings() {
   const body = document.getElementById("standings-body");
@@ -118,6 +190,104 @@ function parseCsv(text) {
   return rows;
 }
 
+/* ---------- Equipos (escudo, nombre y plantilla) ---------- */
+async function initTeams(templates) {
+  const grid = document.getElementById("teams-grid");
+  const meta = document.getElementById("teams-meta");
+  if (!grid) return [];
+  return loadTeams(grid, meta, templates);
+}
+
+async function loadTeams(grid, meta, templates) {
+  try {
+    const [teamsRes, playersRes] = await Promise.all([
+      fetch(TEAMS_CSV_URL, { cache: "no-store" }),
+      fetch(PLAYERS_CSV_URL, { cache: "no-store" }),
+    ]);
+    if (!teamsRes.ok) throw new Error("No se pudo leer la hoja de equipos.");
+
+    const teamsCsv = await teamsRes.text();
+    const teamRows = parseCsv(teamsCsv)
+      .filter((row) => row.some((cell) => cell.trim() !== ""))
+      .slice(1); // encabezado: Equipo, Escudo
+
+    let playerRows = [];
+    if (playersRes.ok) {
+      const playersCsv = await playersRes.text();
+      playerRows = parseCsv(playersCsv)
+        .filter((row) => row.some((cell) => cell.trim() !== ""))
+        .slice(1); // encabezado: Equipo, Jugador, Foto
+    }
+
+    if (teamRows.length === 0) {
+      grid.innerHTML =
+        '<p class="standings-loading">Todavía no hay equipos registrados.</p>';
+      if (meta) meta.textContent = "";
+      return [];
+    }
+
+    grid.innerHTML = teamRows
+      .map((row) => teamCardToHtml(row, playerRows, templates))
+      .join("");
+    bindTeamToggles(grid);
+
+    if (meta) {
+      meta.textContent = `${teamRows.length} equipo${teamRows.length === 1 ? "" : "s"} inscrito${teamRows.length === 1 ? "" : "s"}`;
+    }
+
+    return teamRows.map((row) => (row[0] || "").trim()).filter(Boolean);
+  } catch (err) {
+    grid.innerHTML =
+      '<p class="standings-error">No se pudo cargar la lista de equipos. Revisa que la hoja "Equipos" esté compartida como público.</p>';
+    return [];
+  }
+}
+
+function teamCardToHtml(row, playerRows, templates) {
+  const [equipo, escudo] = row;
+  const nombre = (equipo || "Equipo por definir").trim();
+  const players = playerRows.filter(
+    (p) => (p[0] || "").trim().toLowerCase() === nombre.toLowerCase(),
+  );
+
+  const escudoHtml =
+    escudo && escudo.trim()
+      ? `<img src="${escudo.trim()}" alt="Escudo de ${nombre}" class="team-crest" loading="lazy" />`
+      : `<span class="team-crest team-crest--placeholder" aria-hidden="true">⚽</span>`;
+
+  const jugadoresHtml = players.length
+    ? players
+        .map((p) => {
+          const jugador = (p[1] || "Jugador por definir").trim();
+          const foto = (p[2] || "").trim();
+          const fotoHtml = foto
+            ? `<img src="${foto}" alt="${jugador}" class="player-photo" loading="lazy" />`
+            : `<span class="player-photo player-photo--placeholder" aria-hidden="true">🧑</span>`;
+          return rellenarPlantilla(templates.jugador, {
+            FOTO: fotoHtml,
+            NOMBRE: jugador,
+          });
+        })
+        .join("")
+    : '<li class="player-card player-card--empty">Plantilla por confirmar</li>';
+
+  return rellenarPlantilla(templates.equipo, {
+    ESCUDO: escudoHtml,
+    NOMBRE: nombre,
+    JUGADORES: jugadoresHtml,
+  });
+}
+
+function bindTeamToggles(grid) {
+  grid.querySelectorAll(".team-card-head").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const card = btn.closest(".team-card");
+      const isOpen = card.classList.toggle("is-open");
+      btn.setAttribute("aria-expanded", String(isOpen));
+    });
+  });
+}
+
 /* ---------- Menú móvil ---------- */
 function initMobileNav() {
   const toggle = document.getElementById("nav-toggle");
@@ -186,86 +356,209 @@ function initCountdown() {
 }
 
 /* ---------- Partidos: resultados y próximas fechas ---------- */
-// Misma hoja de cálculo, pestaña "Partidos". Columnas esperadas:
-// A Fecha | B Jornada | C Equipo Local | D Goles Local |
-// E Equipo Visitante | F Goles Visitante | G Hora
-// Si Goles Local y Goles Visitante están vacíos, el partido se muestra
-// como "Próximo" con la hora en vez del marcador.
-const MATCHES_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Partidos`;
+// DOS hojas separadas en el mismo spreadsheet:
+//   "PartidosJugados"  → A Fecha | B Jornada | C Equipo Local | D Goles Local |
+//                        E Equipo Visitante | F Goles Visitante | G Hora
+//   "PartidosProximos" → A Fecha | B Jornada | C Equipo Local |
+//                        D Equipo Visitante | E Hora   (sin columnas de goles)
+// Cuando un partido termina, simplemente MUEVES esa fila de
+// "PartidosProximos" a "PartidosJugados" (cortar y pegar) y le agregas
+// los goles. Así el sitio nunca tiene que "adivinar" si ya se jugó.
+const JUGADOS_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=PartidosJugados`;
+const PROXIMOS_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=PartidosProximos`;
 
-function initMatches() {
-  const list = document.getElementById("match-list");
-  const meta = document.getElementById("matches-meta");
-  if (!list) return;
+// Horarios disponibles para el fixture automático: un partido por hora,
+// pensado para una sola cancha. Agrega o quita horas si usas más de una.
+const HORARIOS_DISPONIBLES = ["15:00", "16:00", "17:00", "18:00", "19:00", "20:00"];
 
-  loadMatches(list, meta);
-  setInterval(() => loadMatches(list, meta), 2 * 60 * 1000);
+/* ---------- Pestañas Próximos / Jugados ---------- */
+function initMatchTabs() {
+  const tabs = document.querySelectorAll(".matches-tab");
+  const panels = {
+    proximos: document.getElementById("match-list-proximos"),
+    jugados: document.getElementById("match-list-jugados"),
+  };
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      tabs.forEach((t) => {
+        t.classList.remove("is-active");
+        t.setAttribute("aria-selected", "false");
+      });
+      tab.classList.add("is-active");
+      tab.setAttribute("aria-selected", "true");
+      const target = tab.dataset.tab;
+      Object.entries(panels).forEach(([key, panel]) => {
+        if (panel) panel.classList.toggle("is-active", key === target);
+      });
+    });
+  });
 }
 
-async function loadMatches(list, meta) {
+// teamNames: lista de equipos ya cargados desde la hoja "Equipos". Se usa
+// como respaldo para generar automáticamente el fixture de próximas fechas
+// (todos contra todos, con hora incluida) cuando la hoja "Partidos" todavía
+// no tiene filas futuras cargadas.
+function initMatches(teamNames, proximoTemplate, jugadoTemplate) {
+  const proximosList = document.getElementById("match-list-proximos");
+  const jugadosList = document.getElementById("match-list-jugados");
+  const meta = document.getElementById("matches-meta");
+  if (!proximosList && !jugadosList) return;
+
+  loadMatches(proximosList, jugadosList, meta, teamNames, proximoTemplate, jugadoTemplate);
+  setInterval(
+    () => loadMatches(proximosList, jugadosList, meta, teamNames, proximoTemplate, jugadoTemplate),
+    2 * 60 * 1000,
+  );
+}
+
+async function loadMatches(proximosList, jugadosList, meta, teamNames, proximoTemplate, jugadoTemplate) {
   try {
-    const response = await fetch(MATCHES_CSV_URL, { cache: "no-store" });
-    if (!response.ok) throw new Error("No se pudo leer la hoja de cálculo.");
+    const [jugadosRes, proximosRes] = await Promise.all([
+      fetch(JUGADOS_CSV_URL, { cache: "no-store" }),
+      fetch(PROXIMOS_CSV_URL, { cache: "no-store" }),
+    ]);
+    if (!jugadosRes.ok || !proximosRes.ok) {
+      throw new Error("No se pudo leer alguna de las hojas de partidos.");
+    }
 
-    const csvText = await response.text();
-    const rows = parseCsv(csvText).filter((row) =>
-      row.some((cell) => cell.trim() !== ""),
-    );
-
-    // La primera fila es el encabezado (Fecha, Jornada...); la ignoramos.
-    const dataRows = rows
-      .slice(1)
+    const jugadosCsv = await jugadosRes.text();
+    const jugadosRows = parseCsv(jugadosCsv)
+      .filter((row) => row.some((cell) => cell.trim() !== ""))
+      .slice(1) // encabezado
       .filter((row) => row[0] && row[0].trim() !== "");
 
-    if (dataRows.length === 0) {
-      list.innerHTML =
-        '<p class="standings-loading">Todavía no hay partidos programados.</p>';
-    } else {
-      list.innerHTML = dataRows.map(matchToHtml).join("");
+    const proximosCsv = await proximosRes.text();
+    let proximosRows = parseCsv(proximosCsv)
+      .filter((row) => row.some((cell) => cell.trim() !== ""))
+      .slice(1) // encabezado
+      .filter((row) => row[0] && row[0].trim() !== "");
+
+    let autoGenerado = false;
+
+    // Si la hoja "PartidosProximos" todavía está vacía, generamos un
+    // fixture "todos contra todos" a partir de los equipos inscritos,
+    // con fecha y hora, arrancando el próximo sábado. Son fechas
+    // tentativas hasta que las confirmes en la hoja de cálculo.
+    if (proximosRows.length === 0 && teamNames && teamNames.length >= 2) {
+      proximosRows = generateRoundRobin(teamNames, nextSaturday());
+      autoGenerado = true;
+    }
+
+    if (jugadosList) {
+      jugadosList.innerHTML = jugadosRows.length
+        ? jugadosRows.map((row) => matchJugadoToHtml(row, jugadoTemplate)).join("")
+        : '<p class="standings-loading">Todavía no se ha jugado ningún partido.</p>';
+    }
+    if (proximosList) {
+      proximosList.innerHTML = proximosRows.length
+        ? proximosRows.map((row) => matchProximoToHtml(row, autoGenerado, proximoTemplate)).join("")
+        : '<p class="standings-loading">Todavía no hay partidos programados.</p>';
     }
 
     if (meta) {
       const now = new Date();
-      meta.textContent = `Última actualización: ${now.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`;
+      const nota = autoGenerado
+        ? " · Próximas fechas tentativas, generadas automáticamente a partir de los equipos inscritos"
+        : "";
+      meta.textContent = `Última actualización: ${now.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}${nota}`;
     }
   } catch (err) {
-    list.innerHTML =
-      '<p class="standings-error">No se pudo cargar el calendario. Revisa que la hoja de Google Sheets esté compartida como público.</p>';
+    console.error(err);
+    const msg =
+      '<p class="standings-error">No se pudo cargar el calendario. Revisa que las hojas "PartidosJugados" y "PartidosProximos" existan y que el spreadsheet esté compartido como público.</p>';
+    if (jugadosList) jugadosList.innerHTML = msg;
+    if (proximosList) proximosList.innerHTML = msg;
   }
 }
 
-function matchToHtml(row) {
-  const [fecha, jornada, local, golesLocal, visitante, golesVisitante, hora] =
-    row;
-
-  const jugado =
-    golesLocal !== undefined &&
-    golesLocal.trim() !== "" &&
-    golesVisitante !== undefined &&
-    golesVisitante.trim() !== "";
-
+// Fila de "PartidosJugados": Fecha | Jornada | Local | Goles Local |
+// Visitante | Goles Visitante | Hora
+function matchJugadoToHtml(row, jugadoTemplate) {
+  const [fecha, jornada, local, golesLocal, visitante, golesVisitante, hora] = row;
   const fechaFormateada = formatMatchDate(fecha);
-  const statusHtml = jugado
-    ? `<span class="match-status match-status--jugado">Jugado</span>`
-    : `<span class="match-status match-status--proximo">Próximo</span>`;
-  const scoreHtml = jugado
-    ? `<span class="match-score">${golesLocal} – ${golesVisitante}</span>`
-    : `<span class="match-score">vs</span>`;
+  const horaHtml = hora ? `<span class="match-hour">${hora}</span>` : "";
 
-  return `
-    <div class="match-row ${jugado ? "" : "match-row--proximo"}">
-      <div class="match-when">
-        <span class="match-date">${fechaFormateada}</span>
-        ${hora ? `<span class="match-hour">${hora}</span>` : ""}
-        <span class="match-jornada">Jornada ${jornada || "-"}</span>
-      </div>
-      <div class="match-teams">
-        <span class="match-team match-team--local">${local || "Por definir"}</span>
-        ${scoreHtml}
-        <span class="match-team match-team--visitante">${visitante || "Por definir"}</span>
-      </div>
-      ${statusHtml}
-    </div>`;
+  return rellenarPlantilla(jugadoTemplate, {
+    FECHA: fechaFormateada,
+    HORA: horaHtml,
+    JORNADA: jornada || "-",
+    LOCAL: local || "Por definir",
+    VISITANTE: visitante || "Por definir",
+    GOLES_LOCAL: golesLocal,
+    GOLES_VISITANTE: golesVisitante,
+  });
+}
+
+// Fila de "PartidosProximos": Fecha | Jornada | Local | Visitante | Hora
+// (sin columnas de goles, porque todavía no se ha jugado)
+function matchProximoToHtml(row, autoGenerado, proximoTemplate) {
+  const [fecha, jornada, local, visitante, hora] = row;
+  const fechaFormateada = formatMatchDate(fecha);
+  const horaHtml = hora ? `<span class="match-hour">${hora}</span>` : "";
+  const tentativaHtml = autoGenerado
+    ? `<span class="match-tentativa">Fecha tentativa</span>`
+    : "";
+
+  return rellenarPlantilla(proximoTemplate, {
+    FECHA: fechaFormateada,
+    HORA: horaHtml,
+    JORNADA: jornada || "-",
+    LOCAL: local || "Por definir",
+    VISITANTE: visitante || "Por definir",
+    TENTATIVA: tentativaHtml,
+  });
+}
+
+// Fixture "todos contra todos" por el método del círculo: cada equipo
+// mantiene su lugar salvo el primero, y el resto rota una posición por
+// jornada. Si el número de equipos es impar, se agrega un "descanso".
+// Dentro de cada jornada, los partidos se reparten uno por hora usando
+// HORARIOS_DISPONIBLES (pensado para una sola cancha).
+// Genera filas con el MISMO formato que "PartidosProximos":
+// [fecha, jornada, local, visitante, hora]
+function generateRoundRobin(teamNames, startDateISO) {
+  let teams = teamNames.filter(Boolean);
+  if (teams.length < 2) return [];
+  if (teams.length % 2 !== 0) teams = [...teams, null];
+
+  const n = teams.length;
+  const rounds = n - 1;
+  const half = n / 2;
+  const schedule = [];
+  let current = teams.slice();
+  const start = new Date(`${startDateISO}T00:00:00`);
+
+  for (let round = 0; round < rounds; round++) {
+    const roundDate = new Date(start);
+    roundDate.setDate(start.getDate() + round * 7); // una jornada por semana
+    const fecha = roundDate.toISOString().slice(0, 10);
+
+    let horaIndex = 0;
+    for (let i = 0; i < half; i++) {
+      const local = current[i];
+      const visitante = current[n - 1 - i];
+      if (local && visitante) {
+        const hora = HORARIOS_DISPONIBLES[horaIndex % HORARIOS_DISPONIBLES.length];
+        schedule.push([fecha, String(round + 1), local, visitante, hora]);
+        horaIndex++;
+      }
+    }
+
+    const fixed = current[0];
+    const rest = current.slice(1);
+    rest.unshift(rest.pop());
+    current = [fixed, ...rest];
+  }
+
+  return schedule;
+}
+
+function nextSaturday() {
+  const d = new Date();
+  const day = d.getDay(); // 0 domingo ... 6 sábado
+  const diff = (6 - day + 7) % 7 || 7;
+  d.setDate(d.getDate() + diff);
+  return d.toISOString().slice(0, 10);
 }
 
 function formatMatchDate(fecha) {
@@ -278,5 +571,3 @@ function formatMatchDate(fecha) {
     month: "short",
   });
 }
-
-/* ---------- Menú móvil ---------- */
